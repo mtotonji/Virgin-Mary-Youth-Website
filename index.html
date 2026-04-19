@@ -5088,7 +5088,7 @@
 
     const VMY_BACKEND_CONFIG = window.VMY_BACKEND_CONFIG || {
       supabaseUrl: 'https://agfvinsrvidbkbzbhabm.supabase.co',
-      supabaseAnonKey: 'sb_publishable_2XpHEPn0EcGN46u_FMhDPw_HQjyHHD-'
+      supabaseAnonKey: 'sb_publishable_2XpHEPn0EcGN46u_FMhDPw_HQjyH'
     };
 
     const SHARED_STATE_DEFAULTS = {
@@ -5180,7 +5180,14 @@
       marchOrders = deepClone(sharedState.merch_orders || []);
     }
 
-    function getSharedStateValue(key, fallback) {
+    
+    function getSupabaseErrorMessage(error) {
+      if (!error) return 'Unknown backend error';
+      if (typeof error === 'string') return error;
+      return error.message || error.details || error.hint || 'Unknown backend error';
+    }
+
+function getSharedStateValue(key, fallback) {
       const value = sharedState[key];
       if (typeof value === 'undefined') return deepClone(fallback);
       return deepClone(value);
@@ -5190,23 +5197,59 @@
       const opts = options || {};
       sharedState[key] = deepClone(value);
       syncLegacyVariablesFromSharedState();
-      if (!backendReady || !supabaseClient) {
-        try {
-          localStorage.setItem('vmy_backend_cache_' + key, JSON.stringify(sharedState[key]));
-        } catch (_) { }
-        if (!opts.silent) renderAll();
-        return false;
-      }
-      // Always keep localStorage in sync as a redundant backup
+
       try { localStorage.setItem('vmy_backend_cache_' + key, JSON.stringify(sharedState[key])); } catch (_) { }
-      const payload = { state_key: key, state_value: sharedState[key], updated_at: new Date().toISOString() };
-      const result = await supabaseClient.from('site_state').upsert(payload, { onConflict: 'state_key' });
-      if (result.error) {
-        console.error(result.error);
-        updateBackendStatus('Backend error - changes not published');
+
+      if (!backendReady || !supabaseClient) {
         if (!opts.silent) renderAll();
         return false;
       }
+
+      const payload = [{ state_key: key, state_value: sharedState[key] }];
+
+      let result = await supabaseClient
+        .from('site_state')
+        .upsert(payload, { onConflict: 'state_key' });
+
+      if (result.error) {
+        const msg = getSupabaseErrorMessage(result.error);
+        console.error('site_state upsert failed:', result.error);
+
+        // Retry once with update-then-insert logic in case the project's upsert path is restricted.
+        try {
+          const updateResult = await supabaseClient
+            .from('site_state')
+            .update({ state_value: sharedState[key] })
+            .eq('state_key', key);
+
+          if (!updateResult.error) {
+            if (!opts.silent) renderAll();
+            updateBackendStatus('Connected to shared database');
+            return true;
+          }
+
+          const insertResult = await supabaseClient
+            .from('site_state')
+            .insert(payload);
+
+          if (!insertResult.error) {
+            if (!opts.silent) renderAll();
+            updateBackendStatus('Connected to shared database');
+            return true;
+          }
+
+          console.error('site_state update fallback failed:', updateResult.error);
+          console.error('site_state insert fallback failed:', insertResult.error);
+        } catch (retryErr) {
+          console.error('site_state retry write failed:', retryErr);
+        }
+
+        updateBackendStatus('Backend write error: ' + msg);
+        if (!opts.silent) renderAll();
+        return false;
+      }
+
+      updateBackendStatus('Connected to shared database');
       if (!opts.silent) renderAll();
       return true;
     }
@@ -5305,7 +5348,7 @@
         backendReady = false;
         sharedState = mergeDefaultState({});
         syncLegacyVariablesFromSharedState();
-        updateBackendStatus('Could not reach shared database');
+        updateBackendStatus('Could not reach shared database: ' + getSupabaseErrorMessage(err));
         sanitizeAllImageAssetPaths();
         cacheWebsitePicDefaults();
         applyWebsitePics({ smooth: true });
@@ -7083,12 +7126,19 @@
           showToast('Could not read that image.', 'error');
           return;
         }
-        setWebsitePicOnPage(key, dataUrl);
+        const previousSrc = getCurrentWebsitePicSrc(key);
         const current = getWebsitePicSettings(key);
         saveWebsitePicSettings(key, current);
+        setWebsitePicOnPage(key, dataUrl);
         const savedToDb = await saveWebsitePic(key, dataUrl);
+        if (!savedToDb) {
+          setWebsitePicOnPage(key, previousSrc);
+        }
         await renderWebsitePicsAdmin();
-        showToast(savedToDb ? 'Website image updated and published.' : 'Could not publish image to the shared site. Please check the backend connection.', savedToDb ? 'success' : 'error');
+        showToast(
+          savedToDb ? 'Website image updated and published.' : 'Could not publish image to the shared site. Please check the backend connection.',
+          savedToDb ? 'success' : 'error'
+        );
       });
     }
 
