@@ -5132,7 +5132,6 @@
     let backendStatusMessage = 'Offline mode';
     let sharedState = JSON.parse(JSON.stringify(SHARED_STATE_DEFAULTS));
     let backendChannel = null;
-    const PENDING_STATE_WRITES_KEY = 'vmy_pending_state_writes';
 
     function normalizePublicAssetUrl(src) {
       if (!src) return '';
@@ -5219,7 +5218,6 @@ function getSharedStateValue(key, fallback) {
       try { localStorage.setItem('vmy_backend_cache_' + key, JSON.stringify(sharedState[key])); } catch (_) { }
 
       if (!backendReady || !supabaseClient) {
-        rememberPendingStateWrite(key, sharedState[key]);
         if (!opts.silent) renderAll();
         return false;
       }
@@ -5242,7 +5240,6 @@ function getSharedStateValue(key, fallback) {
             .eq('state_key', key);
 
           if (!updateResult.error) {
-            clearPendingStateWrite(key);
             if (!opts.silent) renderAll();
             updateBackendStatus('Connected to shared database');
             return true;
@@ -5253,7 +5250,6 @@ function getSharedStateValue(key, fallback) {
             .insert(payload);
 
           if (!insertResult.error) {
-            clearPendingStateWrite(key);
             if (!opts.silent) renderAll();
             updateBackendStatus('Connected to shared database');
             return true;
@@ -5265,13 +5261,11 @@ function getSharedStateValue(key, fallback) {
           console.error('site_state retry write failed:', retryErr);
         }
 
-        rememberPendingStateWrite(key, sharedState[key]);
         updateBackendStatus('Backend write error: ' + msg);
         if (!opts.silent) renderAll();
         return false;
       }
 
-      clearPendingStateWrite(key);
       updateBackendStatus('Connected to shared database');
       if (!opts.silent) renderAll();
       return true;
@@ -5295,74 +5289,6 @@ function getSharedStateValue(key, fallback) {
         return;
       }
       try { localStorage.setItem(k, JSON.stringify(v)); } catch (_) { }
-    }
-
-    function readCachedSharedState() {
-      const cached = {};
-      Object.keys(SHARED_STATE_DEFAULTS).forEach(function (key) {
-        try {
-          const raw = localStorage.getItem('vmy_backend_cache_' + key);
-          if (!raw) return;
-          cached[key] = JSON.parse(raw);
-        } catch (_) { }
-      });
-      return mergeDefaultState(cached);
-    }
-
-    function getPendingStateWrites() {
-      try {
-        const raw = localStorage.getItem(PENDING_STATE_WRITES_KEY);
-        if (!raw) return {};
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : {};
-      } catch (_) {
-        return {};
-      }
-    }
-
-    function setPendingStateWrites(pending) {
-      try {
-        if (!pending || !Object.keys(pending).length) {
-          localStorage.removeItem(PENDING_STATE_WRITES_KEY);
-          return;
-        }
-        localStorage.setItem(PENDING_STATE_WRITES_KEY, JSON.stringify(pending));
-      } catch (_) { }
-    }
-
-    function rememberPendingStateWrite(key, value) {
-      const pending = getPendingStateWrites();
-      pending[key] = deepClone(value);
-      setPendingStateWrites(pending);
-    }
-
-    function clearPendingStateWrite(key) {
-      const pending = getPendingStateWrites();
-      if (!Object.prototype.hasOwnProperty.call(pending, key)) return;
-      delete pending[key];
-      setPendingStateWrites(pending);
-    }
-
-    function overlayPendingStateWrites(state) {
-      const pending = getPendingStateWrites();
-      const merged = mergeDefaultState(state || {});
-      Object.keys(pending).forEach(function (key) {
-        merged[key] = pending[key];
-      });
-      return merged;
-    }
-
-    async function flushPendingStateWrites() {
-      if (!backendReady || !supabaseClient) return false;
-      const pending = getPendingStateWrites();
-      const keys = Object.keys(pending);
-      if (!keys.length) return true;
-      let allOk = true;
-      for (const key of keys) {
-        const ok = await persistSharedStateKey(key, pending[key], { silent: true });
-        if (!ok) allOk = false;
-      }
-      return allOk;
     }
 
     async function fetchRemoteStateSnapshot() {
@@ -5400,15 +5326,14 @@ function getSharedStateValue(key, fallback) {
 
     async function initSharedBackend() {
       const hasConfig = VMY_BACKEND_CONFIG.supabaseUrl && VMY_BACKEND_CONFIG.supabaseAnonKey && window.supabase && window.supabase.createClient;
-      const cachedState = overlayPendingStateWrites(readCachedSharedState());
       if (!hasConfig) {
         backendReady = false;
-        sharedState = cachedState;
+        sharedState = mergeDefaultState({});
         syncLegacyVariablesFromSharedState();
         updateBackendStatus('Backend not configured');
         return false;
       }
-      sharedState = cachedState;
+      sharedState = mergeDefaultState({});
       syncLegacyVariablesFromSharedState();
       try {
         supabaseClient = window.supabase.createClient(VMY_BACKEND_CONFIG.supabaseUrl, VMY_BACKEND_CONFIG.supabaseAnonKey);
@@ -5416,7 +5341,7 @@ function getSharedStateValue(key, fallback) {
 
         const remoteState = await fetchRemoteStateSnapshot();
         if (remoteState) {
-          sharedState = overlayPendingStateWrites(remoteState);
+          sharedState = remoteState;
           syncLegacyVariablesFromSharedState();
           Object.keys(sharedState).forEach(function (key) {
             try { localStorage.setItem('vmy_backend_cache_' + key, JSON.stringify(sharedState[key])); } catch (_) { }
@@ -5424,7 +5349,6 @@ function getSharedStateValue(key, fallback) {
         }
 
         backendReady = true;
-        await flushPendingStateWrites();
         updateBackendStatus('Connected to shared database');
 
         sanitizeAllImageAssetPaths();
@@ -5439,14 +5363,13 @@ function getSharedStateValue(key, fallback) {
       } catch (err) {
         console.error(err);
         backendReady = false;
-        sharedState = cachedState;
+        sharedState = mergeDefaultState({});
         syncLegacyVariablesFromSharedState();
         updateBackendStatus('Could not reach shared database: ' + getSupabaseErrorMessage(err));
         sanitizeAllImageAssetPaths();
         cacheWebsitePicDefaults();
         applyWebsitePics({ smooth: true });
         applyBoardPhotos({ smooth: true });
-        loadCMSContent();
         finalizeImageHydration();
         renderAll();
         return false;
@@ -5617,15 +5540,17 @@ function getSharedStateValue(key, fallback) {
     }
 
     async function saveBoardImageSource(photoId, src) {
+      if (!backendReady || !supabaseClient) return false;
       const next = Object.assign({}, sharedState.board_images || {});
       if (src) next[photoId] = src;
       else delete next[photoId];
-      const published = await persistSharedStateKey('board_images', next, { silent: true });
+      const persisted = await persistSharedStateKey('board_images', next, { silent: true });
+      if (!persisted) return false;
       if (src) await boardPicsDbSet(photoId, src);
       else await boardPicsDbDelete(photoId);
       boardImageCache[photoId] = src;
       if (!src) delete boardImageCache[photoId];
-      return { saved: true, published: !!published };
+      return true;
     }
 
     async function normalizeMerchData() {
@@ -6462,13 +6387,13 @@ function getSharedStateValue(key, fallback) {
       if (!file) return;
       readAndCompressImage(file).then(async function (dataUrl) {
         if (!dataUrl) { showToast('Unable to read that image file.', 'error'); return; }
-        const result = await saveBoardImageSource(photoId, dataUrl);
-        if (!result || !result.saved) { showToast('Could not save that board image.', 'error'); return; }
+        const saved = await saveBoardImageSource(photoId, dataUrl);
+        if (!saved) { showToast('Could not publish board image to the shared site. Please check the backend connection.', 'error'); return; }
         const current = getBoardImageSettings(photoId);
         saveBoardImageSettings(photoId, current);
         applyBoardPhotos();
         renderBoardImageAdmin();
-        showToast(result.published ? 'Board image updated and published. You can now zoom and reposition it in admin.' : 'Board image saved locally and will sync to the shared site once the database reconnects.', result.published ? 'success' : 'warning');
+        showToast('Board image updated and published. You can now zoom and reposition it in admin.', 'success');
       });
     }
 
@@ -6481,14 +6406,14 @@ function getSharedStateValue(key, fallback) {
     }
 
     async function clearBoardImage(photoId) {
-      const result = await saveBoardImageSource(photoId, '');
-      if (!result || !result.saved) { showToast('Could not clear that board image.', 'error'); return; }
+      const cleared = await saveBoardImageSource(photoId, '');
+      if (!cleared) { showToast('Could not clear the board image on the shared site. Please check the backend connection.', 'error'); return; }
       const nextSettings = Object.assign({}, sharedState.board_settings || {});
       delete nextSettings[photoId];
       await persistSharedStateKey('board_settings', nextSettings, { silent: true });
       applyBoardPhotos();
       renderBoardImageAdmin();
-      showToast(result.published ? 'Board image cleared.' : 'Board image cleared locally and will sync once the database reconnects.');
+      showToast('Board image cleared.');
     }
 
     function renderMerchImageAdmin() {
@@ -6897,14 +6822,6 @@ function getSharedStateValue(key, fallback) {
         const key = el.getAttribute('data-cms');
         if (Object.prototype.hasOwnProperty.call(cms, key)) el.innerHTML = cms[key];
       });
-      document.querySelectorAll('[data-cms-img]').forEach(function (img) {
-        const key = img.getAttribute('data-cms-img');
-        const value = key ? cms[key] : null;
-        if (typeof value === 'string' && value) {
-          img.setAttribute('src', value);
-          img.removeAttribute('srcset');
-        }
-      });
     }
 
     // Image file input handler
@@ -6933,8 +6850,27 @@ function getSharedStateValue(key, fallback) {
       // Pre-loads previously fetched Supabase images so returning visitors see
       // images immediately rather than falling back to broken relative paths.
       try {
-        sharedState = overlayPendingStateWrites(readCachedSharedState());
-        syncLegacyVariablesFromSharedState();
+        const cachedPics = localStorage.getItem('vmy_backend_cache_website_pics');
+        if (cachedPics) {
+          const parsed = JSON.parse(cachedPics);
+          if (parsed && typeof parsed === 'object') {
+            sharedState.website_pics = Object.assign({}, sharedState.website_pics || {}, parsed);
+          }
+        }
+        const cachedBoardImgs = localStorage.getItem('vmy_backend_cache_board_images');
+        if (cachedBoardImgs) {
+          const parsed = JSON.parse(cachedBoardImgs);
+          if (parsed && typeof parsed === 'object') {
+            sharedState.board_images = Object.assign({}, sharedState.board_images || {}, parsed);
+          }
+        }
+        const cachedCmsContent = localStorage.getItem('vmy_backend_cache_cms_content');
+        if (cachedCmsContent) {
+          const parsed = JSON.parse(cachedCmsContent);
+          if (parsed && typeof parsed === 'object') {
+            sharedState.cms_content = Object.assign({}, sharedState.cms_content || {}, parsed);
+          }
+        }
       } catch (_) {}
 
       applyWebsitePics();
@@ -6979,7 +6915,11 @@ function getSharedStateValue(key, fallback) {
           const cloneImg = clone.querySelector('[data-cms-img="' + key + '"]');
           if (!cloneImg) return;
           const liveSrc = liveImg.getAttribute('src') || '';
-          if (liveSrc) {
+          const keepPhotoStripPlaceholder = key === 'img-photo-2' || key === 'img-photo-3' || key === 'img-photo-4';
+          if (keepPhotoStripPlaceholder) {
+            cloneImg.setAttribute('data-default-src', '');
+            cloneImg.removeAttribute('src');
+          } else if (liveSrc) {
             cloneImg.setAttribute('src', liveSrc);
             cloneImg.setAttribute('data-default-src', liveSrc);
           } else {
@@ -7140,28 +7080,32 @@ function getSharedStateValue(key, fallback) {
     }
 
     async function saveWebsitePic(key, value) {
+      if (!backendReady || !supabaseClient) return false;
       const next = Object.assign({}, sharedState.website_pics || {});
       next[key] = value;
-      const published = await persistSharedStateKey('website_pics', next, { silent: true });
+      const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
+      if (!persisted) return false;
       await websitePicsDbSet(key, value);
       if (!localWebsitePicsCache) localWebsitePicsCache = {};
       localWebsitePicsCache[key] = value;
       cacheWebsitePicDefaults();
       applyWebsitePics({ smooth: true });
       finalizeImageHydration();
-      return { saved: true, published: !!published };
+      return true;
     }
 
     async function deleteWebsitePic(key) {
+      if (!backendReady || !supabaseClient) return false;
       const next = Object.assign({}, sharedState.website_pics || {});
       delete next[key];
-      const published = await persistSharedStateKey('website_pics', next, { silent: true });
+      const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
+      if (!persisted) return false;
       await websitePicsDbDelete(key);
       if (localWebsitePicsCache) delete localWebsitePicsCache[key];
       cacheWebsitePicDefaults();
       applyWebsitePics({ smooth: true });
       finalizeImageHydration();
-      return { saved: true, published: !!published };
+      return true;
     }
 
     function setWebsitePicOnPage(key, src) {
@@ -7229,14 +7173,18 @@ function getSharedStateValue(key, fallback) {
           showToast('Could not read that image.', 'error');
           return;
         }
+        const previousSrc = getCurrentWebsitePicSrc(key);
         const current = getWebsitePicSettings(key);
         saveWebsitePicSettings(key, current);
         setWebsitePicOnPage(key, dataUrl);
-        const result = await saveWebsitePic(key, dataUrl);
+        const savedToDb = await saveWebsitePic(key, dataUrl);
+        if (!savedToDb) {
+          setWebsitePicOnPage(key, previousSrc);
+        }
         await renderWebsitePicsAdmin();
         showToast(
-          result && result.published ? 'Website image updated and published.' : 'Website image saved locally and will sync to the shared site once the database reconnects.',
-          result && result.published ? 'success' : 'warning'
+          savedToDb ? 'Website image updated and published.' : 'Could not publish image to the shared site. Please check the backend connection.',
+          savedToDb ? 'success' : 'error'
         );
       });
     }
@@ -7256,14 +7204,14 @@ function getSharedStateValue(key, fallback) {
     }
 
     async function clearWebsitePic(key) {
-      const result = await deleteWebsitePic(key);
-      if (!result || !result.saved) { showToast('Could not clear that website image.', 'error'); return; }
+      const cleared = await deleteWebsitePic(key);
+      if (!cleared) { showToast('Could not clear the website image on the shared site. Please check the backend connection.', 'error'); return; }
       const nextSettings = Object.assign({}, sharedState.website_pic_settings || {});
       delete nextSettings[key];
       await persistSharedStateKey('website_pic_settings', nextSettings, { silent: true });
       setWebsitePicOnPage(key, '');
       await renderWebsitePicsAdmin();
-      showToast(result.published ? 'Website image cleared and saved.' : 'Website image cleared locally and will sync once the database reconnects.');
+      showToast('Website image cleared and saved.');
     }
 
     async function renderWebsitePicsAdmin() {
@@ -7477,7 +7425,7 @@ function getSharedStateValue(key, fallback) {
       }
 
       function initSpinners() {
-        document.querySelectorAll('.cms-loading-wrap img, .community-img-tall img, .community-img img').forEach(function (img) {
+        document.querySelectorAll('[data-cms-img]').forEach(function (img) {
           dismissSpinner(img);
         });
       }
@@ -7498,9 +7446,9 @@ function getSharedStateValue(key, fallback) {
           if (m.type === 'childList') {
             m.addedNodes.forEach(function (node) {
               if (node.nodeType !== 1) return;
-              var imgs = node.querySelectorAll ? node.querySelectorAll('.cms-loading-wrap img, .community-img-tall img, .community-img img, [data-cms-img]') : [];
+              var imgs = node.querySelectorAll ? node.querySelectorAll('[data-cms-img]') : [];
               imgs.forEach(dismissSpinner);
-              if (node.tagName === 'IMG' || (node.hasAttribute && node.hasAttribute('data-cms-img'))) dismissSpinner(node);
+              if (node.hasAttribute && node.hasAttribute('data-cms-img')) dismissSpinner(node);
             });
           }
         });
