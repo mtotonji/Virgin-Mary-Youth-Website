@@ -5306,7 +5306,14 @@ function getSharedStateValue(key, fallback) {
     }
 
     function getCachedFallbackState() {
-      return mergeDefaultState({});
+      const cached = {};
+      try {
+        Object.keys(SHARED_STATE_DEFAULTS).forEach(function (key) {
+          const raw = localStorage.getItem('vmy_backend_cache_' + key);
+          if (raw != null) cached[key] = JSON.parse(raw);
+        });
+      } catch (_) { }
+      return mergeDefaultState(cached);
     }
 
     /* ── seedImageCache ────────────────────────────────────────────────────────
@@ -5330,12 +5337,16 @@ function getSharedStateValue(key, fallback) {
       const hasConfig = VMY_BACKEND_CONFIG.supabaseUrl && VMY_BACKEND_CONFIG.supabaseAnonKey && window.supabase && window.supabase.createClient;
       if (!hasConfig) {
         backendReady = false;
-        sharedState = mergeDefaultState({});
+        sharedState = getCachedFallbackState();
         syncLegacyVariablesFromSharedState();
         updateBackendStatus('Backend not configured');
+        sanitizeAllImageAssetPaths();
+        cacheWebsitePicDefaults();
+        applyWebsitePics({ smooth: true });
+        applyBoardPhotos({ smooth: true });
         return false;
       }
-      sharedState = mergeDefaultState({});
+      sharedState = getCachedFallbackState();
       syncLegacyVariablesFromSharedState();
       try {
         supabaseClient = window.supabase.createClient(VMY_BACKEND_CONFIG.supabaseUrl, VMY_BACKEND_CONFIG.supabaseAnonKey);
@@ -5351,6 +5362,8 @@ function getSharedStateValue(key, fallback) {
         }
 
         backendReady = true;
+        if (!localWebsitePicsCache) localWebsitePicsCache = await websitePicsDbGetAll() || {};
+        await flushPendingWebsitePics();
         updateBackendStatus('Connected to shared database');
 
         sanitizeAllImageAssetPaths();
@@ -5365,7 +5378,7 @@ function getSharedStateValue(key, fallback) {
       } catch (err) {
         console.error(err);
         backendReady = false;
-        sharedState = mergeDefaultState({});
+        sharedState = getCachedFallbackState();
         syncLegacyVariablesFromSharedState();
         updateBackendStatus('Could not reach shared database: ' + getSupabaseErrorMessage(err));
         sanitizeAllImageAssetPaths();
@@ -6892,6 +6905,9 @@ function getSharedStateValue(key, fallback) {
       if (!localWebsitePicsCache) {
         localWebsitePicsCache = await websitePicsDbGetAll() || {};
       }
+      if (backendReady && supabaseClient) {
+        await flushPendingWebsitePics();
+      }
       // Seed per-image localStorage from IndexedDB so NEXT page load is instant
       await seedImageCache();
       // Re-apply now that DB data is ready (seamlessly swaps in any newer images)
@@ -7080,37 +7096,134 @@ function getSharedStateValue(key, fallback) {
     }
 
     let localWebsitePicsCache = null;
+    const WEBSITE_PICS_PENDING_KEY = 'vmy_pending_website_pics';
+
+    function getPendingWebsitePics() {
+      try {
+        const raw = localStorage.getItem(WEBSITE_PICS_PENDING_KEY);
+        return raw ? JSON.parse(raw) || {} : {};
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function setPendingWebsitePics(map) {
+      try { localStorage.setItem(WEBSITE_PICS_PENDING_KEY, JSON.stringify(map || {})); } catch (_) { }
+    }
+
+    function queuePendingWebsitePic(key, value) {
+      const next = getPendingWebsitePics();
+      next[key] = (typeof value === 'string' && value) ? value : null;
+      setPendingWebsitePics(next);
+    }
+
+    function clearPendingWebsitePic(key) {
+      const next = getPendingWebsitePics();
+      if (Object.prototype.hasOwnProperty.call(next, key)) {
+        delete next[key];
+        setPendingWebsitePics(next);
+      }
+    }
+
+    async function ensureWebsitePicsCacheLoaded() {
+      if (!localWebsitePicsCache) localWebsitePicsCache = await websitePicsDbGetAll() || {};
+      return localWebsitePicsCache;
+    }
+
+    function getEffectiveWebsitePicsMap() {
+      const merged = Object.assign({}, sharedState.website_pics || {});
+      if (localWebsitePicsCache && typeof localWebsitePicsCache === 'object') {
+        Object.keys(localWebsitePicsCache).forEach(function (cacheKey) {
+          const cacheValue = localWebsitePicsCache[cacheKey];
+          if (typeof cacheValue === 'string' && cacheValue) merged[cacheKey] = cacheValue;
+          else delete merged[cacheKey];
+        });
+      }
+      const pending = getPendingWebsitePics();
+      Object.keys(pending).forEach(function (pendingKey) {
+        const pendingValue = pending[pendingKey];
+        if (typeof pendingValue === 'string' && pendingValue) merged[pendingKey] = pendingValue;
+        else delete merged[pendingKey];
+      });
+      return merged;
+    }
+
+    async function flushPendingWebsitePics() {
+      if (!backendReady || !supabaseClient) return false;
+      await ensureWebsitePicsCacheLoaded();
+      const pending = getPendingWebsitePics();
+      const keys = Object.keys(pending);
+      if (!keys.length) return true;
+      const next = Object.assign({}, sharedState.website_pics || {});
+      keys.forEach(function (pendingKey) {
+        const pendingValue = pending[pendingKey];
+        if (typeof pendingValue === 'string' && pendingValue) next[pendingKey] = pendingValue;
+        else delete next[pendingKey];
+      });
+      const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
+      if (!persisted) return false;
+      sharedState.website_pics = next;
+      syncLegacyVariablesFromSharedState();
+      keys.forEach(clearPendingWebsitePic);
+      return true;
+    }
+
     async function getWebsitePics() {
-      return deepClone(sharedState.website_pics || {});
+      await ensureWebsitePicsCacheLoaded();
+      return deepClone(getEffectiveWebsitePicsMap());
     }
 
     async function saveWebsitePic(key, value) {
-      if (!backendReady || !supabaseClient) return false;
-      const next = Object.assign({}, sharedState.website_pics || {});
+      await ensureWebsitePicsCacheLoaded();
+      const next = getEffectiveWebsitePicsMap();
       next[key] = value;
-      const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
-      if (!persisted) return false;
+      sharedState.website_pics = Object.assign({}, sharedState.website_pics || {}, { [key]: value });
+      syncLegacyVariablesFromSharedState();
+      try { localStorage.setItem('vmy_backend_cache_website_pics', JSON.stringify(next)); } catch (_) { }
       await websitePicsDbSet(key, value);
       if (!localWebsitePicsCache) localWebsitePicsCache = {};
       localWebsitePicsCache[key] = value;
+      queuePendingWebsitePic(key, value);
       cacheWebsitePicDefaults();
       applyWebsitePics({ smooth: true });
       finalizeImageHydration();
-      return true;
+      if (backendReady && supabaseClient) {
+        const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
+        if (persisted) {
+          sharedState.website_pics = next;
+          syncLegacyVariablesFromSharedState();
+          clearPendingWebsitePic(key);
+          return 'published';
+        }
+      }
+      return 'queued';
     }
 
     async function deleteWebsitePic(key) {
-      if (!backendReady || !supabaseClient) return false;
-      const next = Object.assign({}, sharedState.website_pics || {});
+      await ensureWebsitePicsCacheLoaded();
+      const next = getEffectiveWebsitePicsMap();
       delete next[key];
-      const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
-      if (!persisted) return false;
+      const localNext = Object.assign({}, sharedState.website_pics || {});
+      delete localNext[key];
+      sharedState.website_pics = localNext;
+      syncLegacyVariablesFromSharedState();
+      try { localStorage.setItem('vmy_backend_cache_website_pics', JSON.stringify(next)); } catch (_) { }
       await websitePicsDbDelete(key);
       if (localWebsitePicsCache) delete localWebsitePicsCache[key];
+      queuePendingWebsitePic(key, null);
       cacheWebsitePicDefaults();
       applyWebsitePics({ smooth: true });
       finalizeImageHydration();
-      return true;
+      if (backendReady && supabaseClient) {
+        const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
+        if (persisted) {
+          sharedState.website_pics = next;
+          syncLegacyVariablesFromSharedState();
+          clearPendingWebsitePic(key);
+          return 'published';
+        }
+      }
+      return 'queued';
     }
 
     function setWebsitePicOnPage(key, src) {
@@ -7140,12 +7253,13 @@ function getSharedStateValue(key, fallback) {
 
     function applyWebsitePics(opts) {
       var smooth = opts && opts.smooth;
+      const effectiveWebsitePics = getEffectiveWebsitePicsMap();
       sanitizeAllImageAssetPaths();
       cacheWebsitePicDefaults();
       document.querySelectorAll('[data-cms-img]').forEach(function (img) {
         const key = img.getAttribute('data-cms-img');
         const isCloudOnlyStrip = CLOUD_ONLY_STRIP_KEYS.has(key);
-        const fromState = normalizePublicAssetUrl((sharedState.website_pics && sharedState.website_pics[key]) || '');
+        const fromState = normalizePublicAssetUrl((effectiveWebsitePics && effectiveWebsitePics[key]) || '');
         const fallback = isCloudOnlyStrip ? '' : normalizePublicAssetUrl(img.getAttribute('data-default-src') || WEBSITE_PIC_DEFAULTS[key] || '');
         const srcToUse = fromState || fallback;
         const prevSrc = normalizePublicAssetUrl(img.getAttribute('src') || '');
@@ -7179,18 +7293,17 @@ function getSharedStateValue(key, fallback) {
           showToast('Could not read that image.', 'error');
           return;
         }
-        const previousSrc = getCurrentWebsitePicSrc(key);
         const current = getWebsitePicSettings(key);
         saveWebsitePicSettings(key, current);
         setWebsitePicOnPage(key, dataUrl);
-        const savedToDb = await saveWebsitePic(key, dataUrl);
-        if (!savedToDb) {
-          setWebsitePicOnPage(key, previousSrc);
-        }
+        const saveResult = await saveWebsitePic(key, dataUrl);
         await renderWebsitePicsAdmin();
+        if (input) input.value = '';
         showToast(
-          savedToDb ? 'Website image updated and published.' : 'Could not publish image to the shared site. Please check the backend connection.',
-          savedToDb ? 'success' : 'error'
+          saveResult === 'published'
+            ? 'Website image updated and published.'
+            : 'Website image saved locally and will sync when the backend reconnects.',
+          'success'
         );
       });
     }
@@ -7211,13 +7324,17 @@ function getSharedStateValue(key, fallback) {
 
     async function clearWebsitePic(key) {
       const cleared = await deleteWebsitePic(key);
-      if (!cleared) { showToast('Could not clear the website image on the shared site. Please check the backend connection.', 'error'); return; }
       const nextSettings = Object.assign({}, sharedState.website_pic_settings || {});
       delete nextSettings[key];
       await persistSharedStateKey('website_pic_settings', nextSettings, { silent: true });
       setWebsitePicOnPage(key, '');
       await renderWebsitePicsAdmin();
-      showToast('Website image cleared and saved.');
+      showToast(
+        cleared === 'published'
+          ? 'Website image cleared and saved.'
+          : 'Website image cleared locally and will sync when the backend reconnects.',
+        'success'
+      );
     }
 
     async function renderWebsitePicsAdmin() {
