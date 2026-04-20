@@ -3515,11 +3515,66 @@
 
         // Load Supabase-cached website pics from localStorage
         var cachedWebsitePics = {};
+        var IMAGE_CACHE_FRESH_MS = Number((window.VMY_BACKEND_CONFIG && window.VMY_BACKEND_CONFIG.imageCacheFreshMs) || 21600000);
         try {
           var raw = localStorage.getItem('vmy_backend_cache_website_pics');
           if (raw) cachedWebsitePics = JSON.parse(raw) || {};
         } catch (_) {}
+        function getCachedImageRecord(value) {
+          if (!value) return { src: '', updatedAt: 0 };
+          if (typeof value === 'string') return { src: value, updatedAt: 0, legacy: true };
+          if (typeof value === 'object') {
+            return {
+              src: value.src || value.url || value.publicUrl || value.public_url || value.dataUrl || '',
+              updatedAt: Number(value.updatedAt || value.updated_at || value.version || value.ts || 0) || 0
+            };
+          }
+          return { src: '', updatedAt: 0 };
+        }
+        function getCachedImageSrc(value, allowStale) {
+          var record = getCachedImageRecord(value);
+          if (!record.src) return '';
+          if (!allowStale && record.updatedAt && (Date.now() - record.updatedAt) > IMAGE_CACHE_FRESH_MS) return '';
+          return normalizePublicAssetUrl(record.src || '');
+        }
         var CLOUD_ONLY_STRIP_KEYS = { 'img-photo-2': true, 'img-photo-3': true, 'img-photo-4': true };
+        var PRIORITY_IMAGE_KEYS = {
+          'img-about-hero': true,
+          'img-photo-8': true,
+          'img-photo-9': true,
+          'img-photo-10': true,
+          'img-photo-2': true,
+          'img-photo-3': true,
+          'img-photo-4': true,
+          'img-home-hero': true,
+          'img-nav-logo': true
+        };
+
+        function markPriorityImage(img, key) {
+          if (!img) return;
+          var priority = !!(key && PRIORITY_IMAGE_KEYS[key]);
+          try { img.loading = priority ? 'eager' : 'lazy'; } catch (_) {}
+          try { img.decoding = 'async'; } catch (_) {}
+          if (priority) img.setAttribute('fetchpriority', 'high');
+          else img.removeAttribute('fetchpriority');
+        }
+
+        function preloadManagedImage(src) {
+          src = normalizePublicAssetUrl(src || '');
+          if (!src) return;
+          try {
+            var existing = document.head.querySelector('link[data-vmy-preload="' + src.replace(/"/g, '\"') + '"]');
+            if (existing) return;
+          } catch (_) {}
+          try {
+            var link = document.createElement('link');
+            link.rel = 'preload';
+            link.as = 'image';
+            link.href = src;
+            link.setAttribute('data-vmy-preload', src);
+            document.head.appendChild(link);
+          } catch (_) {}
+        }
 
         function sanitizeImageAttrs(img) {
           if (!img || !img.getAttribute) return;
@@ -3541,11 +3596,14 @@
           sanitizeImageAttrs(img);
           var key = img.getAttribute('data-cms-img');
           var isCloudOnlyStrip = !!(key && CLOUD_ONLY_STRIP_KEYS[key]);
-          // For cloud-only strip slots, do not paint from local cache or baked fallbacks.
-          var fromCache = (!isCloudOnlyStrip && key && cachedWebsitePics[key]) ? normalizePublicAssetUrl(cachedWebsitePics[key]) : '';
+          markPriorityImage(img, key);
+          // For cloud-only strip slots, do not paint from stale local cache or baked fallbacks.
+          var cachedValue = key ? cachedWebsitePics[key] : null;
+          var fromCache = (!isCloudOnlyStrip && key && cachedValue) ? getCachedImageSrc(cachedValue, false) : '';
           var fallback = isCloudOnlyStrip ? '' : normalizePublicAssetUrl(img.getAttribute('data-default-src') || img.getAttribute('src') || '');
           var src = fromCache || fallback;
           if (src) {
+            preloadManagedImage(src);
             img.setAttribute('src', src);
             img.removeAttribute('srcset');
           } else {
@@ -5108,7 +5166,9 @@
 
     const VMY_BACKEND_CONFIG = window.VMY_BACKEND_CONFIG || {
       supabaseUrl: 'https://agfvinsrvidbkbzbhabm.supabase.co',
-      supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnZnZpbnNydmlkYmtiemJoYWJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQxMDg1MjksImV4cCI6MjA4OTY4NDUyOX0.e0Yz_ZttXWEeUt5RvBa4t0HWU5QSf45W98g_oOgoubk'
+      supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnZnZpbnNydmlkYmtiemJoYWJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQxMDg1MjksImV4cCI6MjA4OTY4NDUyOX0.e0Yz_ZttXWEeUt5RvBa4t0HWU5QSf45W98g_oOgoubk',
+      storageBucket: 'vmy-site-media',
+      imageCacheFreshMs: 21600000
     };
 
     const SHARED_STATE_DEFAULTS = {
@@ -5141,9 +5201,9 @@
     let backendRetryTimer = null;
     let backendRetryAttempts = 0;
     let siteStateRpcSupported = null;
-    const BACKEND_INIT_TIMEOUT_MS = 8000;
-    const BACKEND_RETRY_BASE_MS = 5000;
-    const BACKEND_RETRY_MAX_MS = 60000;
+    const BACKEND_INIT_TIMEOUT_MS = 3000;
+    const BACKEND_RETRY_BASE_MS = 2000;
+    const BACKEND_RETRY_MAX_MS = 15000;
 
     function normalizePublicAssetUrl(src) {
       if (!src) return '';
@@ -5213,13 +5273,148 @@
     function getSupabaseErrorMessage(error) {
       if (!error) return 'Unknown backend error';
       if (typeof error === 'string') return error;
-      return error.message || error.details || error.hint || 'Unknown backend error';
+      const message = error.message || error.details || error.hint || 'Unknown backend error';
+      if (/timed out|statement timeout|canceling statement/i.test(message)) return 'Shared database is slow to respond';
+      return message;
     }
 
 function getSharedStateValue(key, fallback) {
       const value = sharedState[key];
       if (typeof value === 'undefined') return deepClone(fallback);
       return deepClone(value);
+    }
+
+    const EARLY_IMAGE_CACHE_MAX_AGE_MS = Number(VMY_BACKEND_CONFIG.imageCacheFreshMs || 21600000);
+
+    function isPlainObject(value) {
+      return !!value && Object.prototype.toString.call(value) === '[object Object]';
+    }
+
+    function resolveManagedImageRecord(value) {
+      if (!value) return { src: '', updatedAt: 0, storagePath: '', source: '' };
+      if (typeof value === 'string') {
+        return { src: value, updatedAt: 0, storagePath: '', source: /^data:image\//i.test(value) ? 'inline' : 'url' };
+      }
+      if (!isPlainObject(value)) return { src: '', updatedAt: 0, storagePath: '', source: '' };
+      return {
+        src: value.src || value.url || value.publicUrl || value.public_url || value.dataUrl || '',
+        updatedAt: Number(value.updatedAt || value.updated_at || value.version || value.ts || 0) || 0,
+        storagePath: value.storagePath || value.storage_path || value.path || '',
+        source: value.source || '',
+        mime: value.mime || value.contentType || '',
+        width: Number(value.width || 0) || 0,
+        height: Number(value.height || 0) || 0
+      };
+    }
+
+    function getManagedImageSrc(value) {
+      return normalizePublicAssetUrl(resolveManagedImageRecord(value).src || '');
+    }
+
+    function isManagedImageFresh(value, maxAgeMs) {
+      const ts = resolveManagedImageRecord(value).updatedAt;
+      if (!ts) return true;
+      return (Date.now() - ts) <= (maxAgeMs || EARLY_IMAGE_CACHE_MAX_AGE_MS);
+    }
+
+    function buildManagedImageRecord(src, meta) {
+      const extras = meta && typeof meta === 'object' ? meta : {};
+      return {
+        src: normalizePublicAssetUrl(src || ''),
+        updatedAt: Number(extras.updatedAt || extras.updated_at || Date.now()) || Date.now(),
+        storagePath: extras.storagePath || extras.storage_path || extras.path || '',
+        source: extras.source || (typeof src === 'string' && /^data:image\//i.test(src) ? 'inline' : 'url'),
+        mime: extras.mime || '',
+        width: Number(extras.width || 0) || 0,
+        height: Number(extras.height || 0) || 0
+      };
+    }
+
+    function dataUrlToBlob(dataUrl) {
+      try {
+        const parts = String(dataUrl || '').split(',');
+        if (parts.length < 2) return null;
+        const header = parts[0];
+        const mimeMatch = header.match(/data:([^;]+)/i);
+        const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+        const binary = atob(parts[1]);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i += 1) bytes[i] = binary.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function sanitizeAssetKeyPart(key) {
+      return String(key || 'asset').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'asset';
+    }
+
+    function ensureBackendPreconnect() {
+      try {
+        const origin = new URL(VMY_BACKEND_CONFIG.supabaseUrl).origin;
+        if (!document.head.querySelector('link[data-vmy-preconnect="' + origin + '"]')) {
+          const link = document.createElement('link');
+          link.rel = 'preconnect';
+          link.href = origin;
+          link.crossOrigin = 'anonymous';
+          link.setAttribute('data-vmy-preconnect', origin);
+          document.head.appendChild(link);
+        }
+      } catch (_) { }
+    }
+
+    function getStorageBucketName() {
+      return VMY_BACKEND_CONFIG.storageBucket || 'vmy-site-media';
+    }
+
+    async function uploadManagedAssetDataUrl(kind, key, dataUrl) {
+      if (!supabaseClient || !supabaseClient.storage || !dataUrl) return null;
+      const blob = dataUrlToBlob(dataUrl);
+      if (!blob) return null;
+      const bucket = getStorageBucketName();
+      const ext = /webp/i.test(blob.type || '') ? 'webp' : (/png/i.test(blob.type || '') ? 'png' : 'jpg');
+      const cleanKind = sanitizeAssetKeyPart(kind || 'assets');
+      const cleanKey = sanitizeAssetKeyPart(key || 'image');
+      const stamp = Date.now();
+      const path = cleanKind + '/' + cleanKey + '-' + stamp + '.' + ext;
+      const { error } = await supabaseClient.storage.from(bucket).upload(path, blob, {
+        cacheControl: '31536000',
+        upsert: true,
+        contentType: blob.type || 'image/webp'
+      });
+      if (error) throw error;
+      const publicResult = supabaseClient.storage.from(bucket).getPublicUrl(path);
+      const publicUrl = normalizePublicAssetUrl(publicResult && publicResult.data && publicResult.data.publicUrl || '');
+      if (!publicUrl) return null;
+      return buildManagedImageRecord(publicUrl + (publicUrl.indexOf('?') === -1 ? '?v=' : '&v=') + stamp, {
+        updatedAt: stamp,
+        storagePath: path,
+        source: 'storage',
+        mime: blob.type || 'image/webp'
+      });
+    }
+
+    async function prepareManagedImageValue(kind, key, file) {
+      if (!file) return '';
+      const dataUrl = await readAndCompressImage(file);
+      if (!dataUrl) return '';
+      const localRecord = buildManagedImageRecord(dataUrl, { source: 'inline' });
+      try {
+        if (supabaseClient && supabaseClient.storage) {
+          const uploaded = await uploadManagedAssetDataUrl(kind, key, dataUrl);
+          if (uploaded) return uploaded;
+        }
+      } catch (err) {
+        console.warn('Managed asset storage upload failed:', err);
+      }
+      return localRecord;
+    }
+
+    function isInlineManagedAsset(value) {
+      const src = getManagedImageSrc(value);
+      return /^data:image\//i.test(src || '');
     }
 
     function withTimeout(promise, ms, label) {
@@ -5450,6 +5645,7 @@ function getSharedStateValue(key, fallback) {
       sharedState = getCachedFallbackState();
       syncLegacyVariablesFromSharedState();
       try {
+        ensureBackendPreconnect();
         if (!supabaseClient) {
           supabaseClient = window.supabase.createClient(VMY_BACKEND_CONFIG.supabaseUrl, VMY_BACKEND_CONFIG.supabaseAnonKey);
         }
@@ -5469,6 +5665,7 @@ function getSharedStateValue(key, fallback) {
         clearBackendReconnectTimer();
         if (!localWebsitePicsCache) localWebsitePicsCache = await websitePicsDbGetAll() || {};
         await flushPendingWebsitePics();
+        await flushPendingBoardImages();
         updateBackendStatus('Connected to shared database');
 
         sanitizeAllImageAssetPaths();
@@ -5479,13 +5676,15 @@ function getSharedStateValue(key, fallback) {
         finalizeImageHydration();
         renderAll();
         backendInitInFlight = false;
+        setTimeout(function () { maybeMigrateInlineAssetsToStorage(); }, 1200);
         return true;
       } catch (err) {
         console.error(err);
         backendReady = false;
         sharedState = getCachedFallbackState();
         syncLegacyVariablesFromSharedState();
-        updateBackendStatus('Could not reach shared database: ' + getSupabaseErrorMessage(err));
+        const backendMessage = getSupabaseErrorMessage(err);
+        updateBackendStatus('Using cached site data while the shared database reconnects' + (backendMessage ? ': ' + backendMessage : ''));
         sanitizeAllImageAssetPaths();
         cacheWebsitePicDefaults();
         applyWebsitePics({ smooth: true });
@@ -5666,22 +5865,103 @@ function getSharedStateValue(key, fallback) {
       });
     }
 
+    const BOARD_IMAGES_PENDING_KEY = 'vmy_pending_board_images';
+
+    function getPendingBoardImages() {
+      try {
+        const raw = localStorage.getItem(BOARD_IMAGES_PENDING_KEY);
+        return raw ? JSON.parse(raw) || {} : {};
+      } catch (_) {
+        return {};
+      }
+    }
+
+    function setPendingBoardImages(map) {
+      try { localStorage.setItem(BOARD_IMAGES_PENDING_KEY, JSON.stringify(map || {})); } catch (_) { }
+    }
+
+    function queuePendingBoardImage(key, value) {
+      const next = getPendingBoardImages();
+      next[key] = value || null;
+      setPendingBoardImages(next);
+    }
+
+    function clearPendingBoardImage(key) {
+      const next = getPendingBoardImages();
+      if (Object.prototype.hasOwnProperty.call(next, key)) {
+        delete next[key];
+        setPendingBoardImages(next);
+      }
+    }
+
+    function getEffectiveBoardImagesMap() {
+      const merged = Object.assign({}, sharedState.board_images || {});
+      if (boardImageCache && typeof boardImageCache === 'object') {
+        Object.keys(boardImageCache).forEach(function (cacheKey) {
+          const cacheValue = boardImageCache[cacheKey];
+          if (cacheValue) merged[cacheKey] = cacheValue;
+          else delete merged[cacheKey];
+        });
+      }
+      const pending = getPendingBoardImages();
+      Object.keys(pending).forEach(function (pendingKey) {
+        const pendingValue = pending[pendingKey];
+        if (pendingValue) merged[pendingKey] = pendingValue;
+        else delete merged[pendingKey];
+      });
+      return merged;
+    }
+
+    async function flushPendingBoardImages() {
+      if (!backendReady || !supabaseClient) return false;
+      const pending = getPendingBoardImages();
+      const keys = Object.keys(pending);
+      if (!keys.length) return true;
+      const next = Object.assign({}, sharedState.board_images || {});
+      keys.forEach(function (pendingKey) {
+        const pendingValue = pending[pendingKey];
+        if (pendingValue) next[pendingKey] = pendingValue;
+        else delete next[pendingKey];
+      });
+      const persisted = await persistSharedStateKey('board_images', next, { silent: true });
+      if (!persisted) return false;
+      sharedState.board_images = next;
+      syncLegacyVariablesFromSharedState();
+      keys.forEach(clearPendingBoardImage);
+      return true;
+    }
+
     function getBoardImageSource(photoId) {
-      return (sharedState.board_images || {})[photoId] || '';
+      return getEffectiveBoardImagesMap()[photoId] || '';
     }
 
     async function saveBoardImageSource(photoId, src) {
-      if (!backendReady || !supabaseClient) return false;
-      const next = Object.assign({}, sharedState.board_images || {});
+      const next = getEffectiveBoardImagesMap();
       if (src) next[photoId] = src;
       else delete next[photoId];
-      const persisted = await persistSharedStateKey('board_images', next, { silent: true });
-      if (!persisted) return false;
+      const localNext = Object.assign({}, sharedState.board_images || {});
+      if (src) localNext[photoId] = src;
+      else delete localNext[photoId];
+      sharedState.board_images = localNext;
+      syncLegacyVariablesFromSharedState();
+      try { localStorage.setItem('vmy_backend_cache_board_images', JSON.stringify(next)); } catch (_) { }
       if (src) await boardPicsDbSet(photoId, src);
       else await boardPicsDbDelete(photoId);
       boardImageCache[photoId] = src;
       if (!src) delete boardImageCache[photoId];
-      return true;
+      queuePendingBoardImage(photoId, src);
+      applyBoardPhotos({ smooth: true });
+      if (backendReady && supabaseClient) {
+        const persisted = await persistSharedStateKey('board_images', next, { silent: true });
+        if (persisted) {
+          sharedState.board_images = next;
+          syncLegacyVariablesFromSharedState();
+          clearPendingBoardImage(photoId);
+          return 'published';
+        }
+      }
+      scheduleBackendReconnect();
+      return 'queued';
     }
 
     async function normalizeMerchData() {
@@ -5774,8 +6054,10 @@ function getSharedStateValue(key, fallback) {
 
     function getMerchImages(m) {
       const imgs = [];
-      if (m.image) imgs.push({ slot: 1, src: m.image, style: merchImageStyle(m, 1) });
-      if (m.image2) imgs.push({ slot: 2, src: m.image2, style: merchImageStyle(m, 2) });
+      const img1 = getManagedImageSrc(m.image);
+      const img2 = getManagedImageSrc(m.image2);
+      if (img1) imgs.push({ slot: 1, src: img1, style: merchImageStyle(m, 1) });
+      if (img2) imgs.push({ slot: 2, src: img2, style: merchImageStyle(m, 2) });
       return imgs;
     }
 
@@ -5785,8 +6067,10 @@ function getSharedStateValue(key, fallback) {
       BOARD_PHOTOS.forEach(function (person) {
         const img = document.getElementById(person.id);
         if (!img) return;
+        try { img.loading = 'lazy'; img.decoding = 'async'; img.removeAttribute('fetchpriority'); } catch (_) { }
         const placeholder = img.parentElement ? img.parentElement.querySelector('span') : null;
-        const fromState = normalizePublicAssetUrl((sharedState.board_images && sharedState.board_images[person.id]) || '');
+        const effectiveBoardImages = getEffectiveBoardImagesMap();
+        const fromState = getManagedImageSrc(effectiveBoardImages[person.id] || '');
         const fromBaked = normalizePublicAssetUrl(img.getAttribute('data-default-src') || '');
         const srcToUse = fromState || fromBaked || '';
         if (srcToUse) {
@@ -5798,7 +6082,8 @@ function getSharedStateValue(key, fallback) {
             img.classList.add('loaded');
             if (placeholder) placeholder.style.display = 'none';
           };
-          if (useSmooth && srcChanged && img.classList.contains('loaded')) {
+          const shouldPreloadSwap = useSmooth && srcChanged && img.classList.contains('loaded') && !shouldInstantApplyManagedImage(srcToUse);
+          if (shouldPreloadSwap) {
             const tempImg = new Image();
             tempImg.onload = function () { applyNow(srcToUse); };
             tempImg.onerror = function () { if (fromBaked && fromBaked !== srcToUse) applyNow(fromBaked); };
@@ -6404,9 +6689,9 @@ function getSharedStateValue(key, fallback) {
 
     /* ── Client-Side Image Compression ── */
     function readAndCompressImage(file, maxW, maxH, quality) {
-      maxW = maxW || 1200;
-      maxH = maxH || 1200;
-      quality = quality || 0.75;
+      maxW = maxW || 900;
+      maxH = maxH || 900;
+      quality = quality || 0.60;
       return new Promise(function (resolve) {
         if (!file) return resolve('');
         const reader = new FileReader();
@@ -6415,17 +6700,26 @@ function getSharedStateValue(key, fallback) {
           img.onload = function () {
             let width = img.naturalWidth || img.width;
             let height = img.naturalHeight || img.height;
+            if (!width || !height) return resolve(e.target.result || '');
             if (width > maxW || height > maxH) {
               const ratio = Math.min(maxW / width, maxH / height);
-              width = Math.round(width * ratio);
-              height = Math.round(height * ratio);
+              width = Math.max(1, Math.round(width * ratio));
+              height = Math.max(1, Math.round(height * ratio));
             }
             const canvas = document.createElement('canvas');
             canvas.width = width;
             canvas.height = height;
-            const ctx = canvas.getContext('2d');
+            const ctx = canvas.getContext('2d', { alpha: false });
+            if (!ctx) return resolve(e.target.result || '');
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
             ctx.drawImage(img, 0, 0, width, height);
-            resolve(canvas.toDataURL('image/jpeg', quality));
+            let webp = '';
+            let jpeg = '';
+            try { webp = canvas.toDataURL('image/webp', quality); } catch (_) { }
+            try { jpeg = canvas.toDataURL('image/jpeg', Math.min(quality + 0.04, 0.66)); } catch (_) { }
+            const out = (webp && webp.indexOf('data:image/webp') === 0 && (!jpeg || webp.length <= jpeg.length)) ? webp : (jpeg || webp || e.target.result || '');
+            resolve(out);
           };
           img.onerror = function () { resolve(e.target.result || ''); };
           img.src = e.target.result;
@@ -6447,8 +6741,8 @@ function getSharedStateValue(key, fallback) {
       const soldOut = document.getElementById('am-soldout') ? document.getElementById('am-soldout').checked : false;
       if (!name || !price || !desc || !sizes.length) { showToast('Please complete all merch fields.', 'error'); return; }
       const item = { id: Date.now(), name, price, type, desc, sizes, badge: null, image: '', image2: '', soldOut, imageZoom: 1, imageX: 50, imageY: 50, image2Zoom: 1, image2X: 50, image2Y: 50 };
-      function readFileAsDataURL(file) {
-        return readAndCompressImage(file);
+      function readFileAsDataURL(file, suffix) {
+        return prepareManagedImageValue('merch', name + '-' + (suffix || 'image'), file);
       }
       async function finishAdd() {
         merchData.unshift(item); await persistSharedStateKey('merch', merchData);
@@ -6460,8 +6754,8 @@ function getSharedStateValue(key, fallback) {
         showToast('Merch item added!');
       }
       Promise.all([
-        readFileAsDataURL(imageInput && imageInput.files && imageInput.files[0]),
-        readFileAsDataURL(imageInput2 && imageInput2.files && imageInput2.files[0])
+        readFileAsDataURL(imageInput && imageInput.files && imageInput.files[0], 'image1'),
+        readFileAsDataURL(imageInput2 && imageInput2.files && imageInput2.files[0], 'image2')
       ]).then(async function (results) {
         item.image = results[0] || '';
         item.image2 = results[1] || '';
@@ -6487,7 +6781,7 @@ function getSharedStateValue(key, fallback) {
         return `<div class="admin-list-row" style="align-items:flex-start;gap:1rem;flex-wrap:wrap">
       <div style="display:flex;align-items:center;gap:.85rem;min-width:220px">
         <div style="width:64px;height:64px;border-radius:50%;overflow:hidden;background:var(--cream);display:flex;align-items:center;justify-content:center;border:1px solid var(--cream-dk);flex-shrink:0">
-          ${saved ? `<img src="${saved}" alt="${person.name}" style="${boardImageStyle(person.id)}" />` : '👤'}
+          ${saved ? `<img src="${getManagedImageSrc(saved)}" alt="${person.name}" style="${boardImageStyle(person.id)}" />` : '👤'}
         </div>
         <div><strong>${person.name}</strong><div class="admin-list-meta" style="margin-left:0">${person.role}</div></div>
       </div>
@@ -6516,15 +6810,21 @@ function getSharedStateValue(key, fallback) {
     function uploadBoardImage(photoId, input) {
       const file = input && input.files && input.files[0];
       if (!file) return;
-      readAndCompressImage(file).then(async function (dataUrl) {
-        if (!dataUrl) { showToast('Unable to read that image file.', 'error'); return; }
-        const saved = await saveBoardImageSource(photoId, dataUrl);
-        if (!saved) { showToast('Could not publish board image to the shared site. Please check the backend connection.', 'error'); return; }
+      prepareManagedImageValue('board', photoId, file).then(async function (assetValue) {
+        const previewSrc = getManagedImageSrc(assetValue);
+        if (!previewSrc) { showToast('Unable to read that image file.', 'error'); return; }
         const current = getBoardImageSettings(photoId);
         saveBoardImageSettings(photoId, current);
-        applyBoardPhotos();
+        const saved = await saveBoardImageSource(photoId, assetValue);
+        applyBoardPhotos({ smooth: true });
         renderBoardImageAdmin();
-        showToast('Board image updated and published. You can now zoom and reposition it in admin.', 'success');
+        if (input) input.value = '';
+        showToast(
+          saved === 'published'
+            ? 'Board image updated and published. You can now zoom and reposition it in admin.'
+            : 'Board image saved locally and will sync when the backend reconnects.',
+          'success'
+        );
       });
     }
 
@@ -6538,13 +6838,15 @@ function getSharedStateValue(key, fallback) {
 
     async function clearBoardImage(photoId) {
       const cleared = await saveBoardImageSource(photoId, '');
-      if (!cleared) { showToast('Could not clear the board image on the shared site. Please check the backend connection.', 'error'); return; }
       const nextSettings = Object.assign({}, sharedState.board_settings || {});
       delete nextSettings[photoId];
       await persistSharedStateKey('board_settings', nextSettings, { silent: true });
-      applyBoardPhotos();
+      applyBoardPhotos({ smooth: true });
       renderBoardImageAdmin();
-      showToast('Board image cleared.');
+      showToast(
+        cleared === 'published' ? 'Board image cleared.' : 'Board image cleared locally and will sync when the backend reconnects.',
+        'success'
+      );
     }
 
     function renderMerchImageAdmin() {
@@ -6564,7 +6866,7 @@ function getSharedStateValue(key, fallback) {
         </div>
         <div style="display:flex;gap:.85rem;align-items:flex-start;flex-wrap:wrap">
           <div style="width:76px;height:76px;border-radius:12px;overflow:hidden;background:var(--cream);display:flex;align-items:center;justify-content:center;border:1px solid var(--cream-dk);flex-shrink:0">
-            ${hasImage ? `<img src="${slot === 1 ? m.image : m.image2}" alt="${m.name} ${label}" style="${merchImageStyle(m, slot)}" />` : m.type.split(' ')[0]}
+            ${hasImage ? `<img src="${slot === 1 ? getManagedImageSrc(m.image) : getManagedImageSrc(m.image2)}" alt="${m.name} ${label}" style="${merchImageStyle(m, slot)}" />` : m.type.split(' ')[0]}
           </div>
           <div style="display:flex;flex-direction:column;gap:.75rem;flex:1;min-width:240px">
             ${hasImage ? `<div style="display:grid;grid-template-columns:90px 1fr 48px;gap:.55rem;align-items:center">
@@ -6585,7 +6887,7 @@ function getSharedStateValue(key, fallback) {
         return `<div class="admin-list-row" style="align-items:flex-start;gap:1rem;flex-wrap:wrap">
       <div style="display:flex;align-items:center;gap:.85rem;min-width:220px">
         <div style="width:64px;height:64px;border-radius:12px;overflow:hidden;background:var(--cream);display:flex;align-items:center;justify-content:center;border:1px solid var(--cream-dk);flex-shrink:0">
-          ${m.image ? `<img src="${m.image}" alt="${m.name}" style="${merchImageStyle(m, 1)}" />` : m.type.split(' ')[0]}
+          ${m.image ? `<img src="${getManagedImageSrc(m.image)}" alt="${m.name}" style="${merchImageStyle(m, 1)}" />` : m.type.split(' ')[0]}
         </div>
         <div><strong>${m.name}</strong><div class="admin-list-meta" style="margin-left:0">${m.price}</div></div>
       </div>
@@ -6601,13 +6903,14 @@ function getSharedStateValue(key, fallback) {
       if (typeof slot !== 'number') { input = slot; slot = 1; }
       const file = input && input.files && input.files[0];
       if (!file) return;
-      readAndCompressImage(file).then(async function (dataUrl) {
-        if (!dataUrl) return;
+      prepareManagedImageValue('merch', String(id) + '-' + String(slot), file).then(async function (assetValue) {
+        const previewSrc = getManagedImageSrc(assetValue);
+        if (!previewSrc) return;
         merchData = merchData.map(function (m) {
           if (m.id !== id) return m;
           const patch = {};
           const suffix = slot === 2 ? '2' : '';
-          patch['image' + suffix] = dataUrl;
+          patch['image' + suffix] = assetValue;
           patch['image' + suffix + 'Zoom'] = typeof m['image' + suffix + 'Zoom'] === 'number' ? m['image' + suffix + 'Zoom'] : 1;
           patch['image' + suffix + 'X'] = typeof m['image' + suffix + 'X'] === 'number' ? m['image' + suffix + 'X'] : 50;
           patch['image' + suffix + 'Y'] = typeof m['image' + suffix + 'Y'] === 'number' ? m['image' + suffix + 'Y'] : 50;
@@ -6615,6 +6918,7 @@ function getSharedStateValue(key, fallback) {
         });
         await persistSharedStateKey('merch', merchData);
         renderHomeMerch(); renderMerchPage(); renderAdminLists(); renderMerchImageAdmin();
+        if (input) input.value = '';
         showToast('Merch image ' + slot + ' updated.');
       });
     }
@@ -6988,6 +7292,9 @@ function getSharedStateValue(key, fallback) {
             const sanitizedPics = Object.assign({}, parsed);
             CLOUD_ONLY_STRIP_KEYS.forEach(function (key) { delete sanitizedPics[key]; });
             sharedState.website_pics = Object.assign({}, sharedState.website_pics || {}, sanitizedPics);
+            ['img-about-hero', 'img-photo-8', 'img-photo-9', 'img-photo-10', 'img-home-hero', 'img-nav-logo'].forEach(function (key) {
+              if (sanitizedPics[key]) maybePreloadCriticalManagedImage(key, sanitizedPics[key]);
+            });
           }
         }
         const cachedBoardImgs = localStorage.getItem('vmy_backend_cache_board_images');
@@ -7211,6 +7518,84 @@ function getSharedStateValue(key, fallback) {
       });
     }
 
+    let inlineAssetMigrationInFlight = false;
+
+    async function maybeMigrateInlineAssetsToStorage() {
+      if (inlineAssetMigrationInFlight || !backendReady || !supabaseClient || !supabaseClient.storage) return false;
+      inlineAssetMigrationInFlight = true;
+      try {
+        let websiteChanged = false;
+        const nextWebsite = Object.assign({}, sharedState.website_pics || {});
+        for (const key of Object.keys(nextWebsite)) {
+          if (!isInlineManagedAsset(nextWebsite[key])) continue;
+          try {
+            const migrated = await uploadManagedAssetDataUrl('website-pics', key, getManagedImageSrc(nextWebsite[key]));
+            if (migrated) { nextWebsite[key] = migrated; websiteChanged = true; }
+          } catch (err) { console.warn('website image migration skipped for', key, err); }
+        }
+        if (websiteChanged) {
+          await persistSharedStateKey('website_pics', nextWebsite, { silent: true });
+          sharedState.website_pics = nextWebsite;
+          try { localStorage.setItem('vmy_backend_cache_website_pics', JSON.stringify(nextWebsite)); } catch (_) { }
+        }
+
+        let boardChanged = false;
+        const nextBoard = Object.assign({}, sharedState.board_images || {});
+        for (const key of Object.keys(nextBoard)) {
+          if (!isInlineManagedAsset(nextBoard[key])) continue;
+          try {
+            const migrated = await uploadManagedAssetDataUrl('board', key, getManagedImageSrc(nextBoard[key]));
+            if (migrated) { nextBoard[key] = migrated; boardChanged = true; }
+          } catch (err) { console.warn('board image migration skipped for', key, err); }
+        }
+        if (boardChanged) {
+          await persistSharedStateKey('board_images', nextBoard, { silent: true });
+          sharedState.board_images = nextBoard;
+          try { localStorage.setItem('vmy_backend_cache_board_images', JSON.stringify(nextBoard)); } catch (_) { }
+        }
+
+        let merchChanged = false;
+        const nextMerch = (sharedState.merch || []).map(function (item, index) {
+          const clone = Object.assign({}, item);
+          return clone;
+        });
+        for (let i = 0; i < nextMerch.length; i += 1) {
+          const item = nextMerch[i];
+          if (isInlineManagedAsset(item.image)) {
+            try {
+              const migrated = await uploadManagedAssetDataUrl('merch', String(item.id || i) + '-1', getManagedImageSrc(item.image));
+              if (migrated) { item.image = migrated; merchChanged = true; }
+            } catch (err) { console.warn('merch image 1 migration skipped for', item.id, err); }
+          }
+          if (isInlineManagedAsset(item.image2)) {
+            try {
+              const migrated = await uploadManagedAssetDataUrl('merch', String(item.id || i) + '-2', getManagedImageSrc(item.image2));
+              if (migrated) { item.image2 = migrated; merchChanged = true; }
+            } catch (err) { console.warn('merch image 2 migration skipped for', item.id, err); }
+          }
+        }
+        if (merchChanged) {
+          merchData = nextMerch;
+          await persistSharedStateKey('merch', nextMerch, { silent: true });
+          sharedState.merch = nextMerch;
+        }
+
+        if (websiteChanged || boardChanged || merchChanged) {
+          syncLegacyVariablesFromSharedState();
+          applyWebsitePics({ smooth: true });
+          applyBoardPhotos({ smooth: true });
+          renderHomeMerch();
+          renderMerchPage();
+          renderMerchImageAdmin();
+          renderWebsitePicsAdmin();
+          renderBoardImageAdmin();
+        }
+        return websiteChanged || boardChanged || merchChanged;
+      } finally {
+        inlineAssetMigrationInFlight = false;
+      }
+    }
+
     let localWebsitePicsCache = null;
     const WEBSITE_PICS_PENDING_KEY = 'vmy_pending_website_pics';
 
@@ -7229,7 +7614,7 @@ function getSharedStateValue(key, fallback) {
 
     function queuePendingWebsitePic(key, value) {
       const next = getPendingWebsitePics();
-      next[key] = (typeof value === 'string' && value) ? value : null;
+      next[key] = value || null;
       setPendingWebsitePics(next);
     }
 
@@ -7251,14 +7636,14 @@ function getSharedStateValue(key, fallback) {
       if (localWebsitePicsCache && typeof localWebsitePicsCache === 'object') {
         Object.keys(localWebsitePicsCache).forEach(function (cacheKey) {
           const cacheValue = localWebsitePicsCache[cacheKey];
-          if (typeof cacheValue === 'string' && cacheValue) merged[cacheKey] = cacheValue;
+          if (cacheValue) merged[cacheKey] = cacheValue;
           else delete merged[cacheKey];
         });
       }
       const pending = getPendingWebsitePics();
       Object.keys(pending).forEach(function (pendingKey) {
         const pendingValue = pending[pendingKey];
-        if (typeof pendingValue === 'string' && pendingValue) merged[pendingKey] = pendingValue;
+        if (pendingValue) merged[pendingKey] = pendingValue;
         else delete merged[pendingKey];
       });
       return merged;
@@ -7273,7 +7658,7 @@ function getSharedStateValue(key, fallback) {
       const next = Object.assign({}, sharedState.website_pics || {});
       keys.forEach(function (pendingKey) {
         const pendingValue = pending[pendingKey];
-        if (typeof pendingValue === 'string' && pendingValue) next[pendingKey] = pendingValue;
+        if (pendingValue) next[pendingKey] = pendingValue;
         else delete next[pendingKey];
       });
       const persisted = await persistSharedStateKey('website_pics', next, { silent: true });
@@ -7344,10 +7729,62 @@ function getSharedStateValue(key, fallback) {
       return 'queued';
     }
 
+    function shouldInstantApplyManagedImage(src) {
+      return !src || /^(data:|blob:)/i.test(String(src || '').trim());
+    }
+
+    function setManagedImagePerformanceAttrs(img, key) {
+      if (!img) return;
+      const priorityKeys = {
+        'img-about-hero': true,
+        'img-photo-8': true,
+        'img-photo-9': true,
+        'img-photo-10': true,
+        'img-photo-2': true,
+        'img-photo-3': true,
+        'img-photo-4': true,
+        'img-home-hero': true,
+        'img-nav-logo': true
+      };
+      const isPriority = !!priorityKeys[key];
+      try { img.loading = isPriority ? 'eager' : 'lazy'; } catch (_) { }
+      try { img.decoding = 'async'; } catch (_) { }
+      if (isPriority) img.setAttribute('fetchpriority', 'high');
+      else img.removeAttribute('fetchpriority');
+    }
+
+    function maybePreloadCriticalManagedImage(key, src) {
+      const priorityKeys = {
+        'img-about-hero': true,
+        'img-photo-8': true,
+        'img-photo-9': true,
+        'img-photo-10': true,
+        'img-home-hero': true,
+        'img-nav-logo': true
+      };
+      if (!priorityKeys[key]) return;
+      const normalized = normalizePublicAssetUrl(src || '');
+      if (!normalized) return;
+      try {
+        const existing = document.head.querySelector('link[data-vmy-critical-preload="' + normalized.replace(/"/g, '\"') + '"]');
+        if (existing) return;
+      } catch (_) { }
+      try {
+        const link = document.createElement('link');
+        link.rel = 'preload';
+        link.as = 'image';
+        link.href = normalized;
+        link.setAttribute('data-vmy-critical-preload', normalized);
+        document.head.appendChild(link);
+      } catch (_) { }
+    }
+
     function setWebsitePicOnPage(key, src) {
       document.querySelectorAll('[data-cms-img="' + key + '"]').forEach(function (img) {
-        const normalizedSrc = normalizePublicAssetUrl(src || '');
+        setManagedImagePerformanceAttrs(img, key);
+        const normalizedSrc = getManagedImageSrc(src || '');
         if (normalizedSrc) {
+          maybePreloadCriticalManagedImage(key, normalizedSrc);
           img.setAttribute('src', normalizedSrc);
           img.style.cssText = websitePicStyle(key);
           img.removeAttribute('srcset');
@@ -7377,28 +7814,25 @@ function getSharedStateValue(key, fallback) {
       document.querySelectorAll('[data-cms-img]').forEach(function (img) {
         const key = img.getAttribute('data-cms-img');
         const isCloudOnlyStrip = CLOUD_ONLY_STRIP_KEYS.has(key);
-        const fromState = normalizePublicAssetUrl((effectiveWebsitePics && effectiveWebsitePics[key]) || '');
+        setManagedImagePerformanceAttrs(img, key);
+        const fromState = getManagedImageSrc((effectiveWebsitePics && effectiveWebsitePics[key]) || '');
         const fallback = isCloudOnlyStrip ? '' : normalizePublicAssetUrl(img.getAttribute('data-default-src') || WEBSITE_PIC_DEFAULTS[key] || '');
         const srcToUse = fromState || fallback;
         const prevSrc = normalizePublicAssetUrl(img.getAttribute('src') || '');
         if (srcToUse) {
           const applyNow = function (finalSrc) {
+            maybePreloadCriticalManagedImage(key, finalSrc);
             img.setAttribute('src', finalSrc);
             img.style.cssText = websitePicStyle(key);
             img.removeAttribute('srcset');
           };
-          if (prevSrc !== srcToUse && smooth) {
-            const tmp = new Image();
-            tmp.onload = function () { applyNow(srcToUse); };
-            tmp.onerror = function () { if (fallback && fallback !== srcToUse) applyNow(fallback); };
-            tmp.src = srcToUse;
-          } else {
-            applyNow(srcToUse);
-          }
+          applyNow(srcToUse);
+          img.classList.add('loaded');
         } else {
           img.removeAttribute('src');
           img.style.cssText = '';
           img.removeAttribute('srcset');
+          img.classList.remove('loaded');
         }
       });
     }
@@ -7406,15 +7840,16 @@ function getSharedStateValue(key, fallback) {
     function uploadWebsitePic(key, input) {
       const file = input && input.files && input.files[0];
       if (!file) return;
-      readAndCompressImage(file).then(async function (dataUrl) {
-        if (!dataUrl) {
+      prepareManagedImageValue('website-pics', key, file).then(async function (assetValue) {
+        const previewSrc = getManagedImageSrc(assetValue);
+        if (!previewSrc) {
           showToast('Could not read that image.', 'error');
           return;
         }
         const current = getWebsitePicSettings(key);
         saveWebsitePicSettings(key, current);
-        setWebsitePicOnPage(key, dataUrl);
-        const saveResult = await saveWebsitePic(key, dataUrl);
+        setWebsitePicOnPage(key, assetValue);
+        const saveResult = await saveWebsitePic(key, assetValue);
         await renderWebsitePicsAdmin();
         if (input) input.value = '';
         showToast(
@@ -7655,7 +8090,8 @@ function getSharedStateValue(key, fallback) {
         if (!parent) return;
         var key = img.getAttribute && img.getAttribute('data-cms-img');
         var isCloudOnlyStrip = !!(key && CLOUD_ONLY_STRIP_KEYS.has(key));
-        var hasSharedImage = !!(key && sharedState && sharedState.website_pics && sharedState.website_pics[key]);
+        var effectiveWebsitePics = (typeof getEffectiveWebsitePicsMap === 'function') ? getEffectiveWebsitePicsMap() : (sharedState && sharedState.website_pics) || {};
+        var hasSharedImage = !!(key && effectiveWebsitePics && effectiveWebsitePics[key]);
         if (isCloudOnlyStrip && !hasSharedImage) {
           parent.classList.remove('cms-loaded');
           return;
@@ -7666,7 +8102,8 @@ function getSharedStateValue(key, fallback) {
           parent.classList.remove('cms-loaded');
           img.addEventListener('load', function () {
             if (isCloudOnlyStrip) {
-              var stillHasSharedImage = !!(key && sharedState && sharedState.website_pics && sharedState.website_pics[key]);
+              var effectiveWebsitePicsNow = (typeof getEffectiveWebsitePicsMap === 'function') ? getEffectiveWebsitePicsMap() : (sharedState && sharedState.website_pics) || {};
+              var stillHasSharedImage = !!(key && effectiveWebsitePicsNow && effectiveWebsitePicsNow[key]);
               if (!stillHasSharedImage) {
                 parent.classList.remove('cms-loaded');
                 return;
