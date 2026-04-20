@@ -3623,6 +3623,9 @@
       renderMerchOrdersTable(); showToast('Merch orders cleared.');
     }
 
+    window.addEventListener('online', function () { scheduleBackendReconnect(); });
+    window.addEventListener('focus', function () { if (!backendReady) scheduleBackendReconnect(); });
+
     /* Call on init */
     renderMerchOrdersTable();
 
@@ -5134,6 +5137,13 @@
     let backendStatusMessage = 'Offline mode';
     let sharedState = JSON.parse(JSON.stringify(SHARED_STATE_DEFAULTS));
     let backendChannel = null;
+    let backendInitInFlight = false;
+    let backendRetryTimer = null;
+    let backendRetryAttempts = 0;
+    let siteStateRpcSupported = null;
+    const BACKEND_INIT_TIMEOUT_MS = 8000;
+    const BACKEND_RETRY_BASE_MS = 5000;
+    const BACKEND_RETRY_MAX_MS = 60000;
 
     function normalizePublicAssetUrl(src) {
       if (!src) return '';
@@ -5212,6 +5222,66 @@ function getSharedStateValue(key, fallback) {
       return deepClone(value);
     }
 
+    function withTimeout(promise, ms, label) {
+      return Promise.race([
+        promise,
+        new Promise(function (_, reject) {
+          setTimeout(function () {
+            reject(new Error((label || 'Request') + ' timed out after ' + ms + 'ms'));
+          }, ms);
+        })
+      ]);
+    }
+
+    function clearBackendReconnectTimer() {
+      if (backendRetryTimer) {
+        clearTimeout(backendRetryTimer);
+        backendRetryTimer = null;
+      }
+    }
+
+    function scheduleBackendReconnect() {
+      if (backendReady || backendInitInFlight || backendRetryTimer) return;
+      const delay = Math.min(BACKEND_RETRY_BASE_MS * Math.pow(2, backendRetryAttempts), BACKEND_RETRY_MAX_MS);
+      backendRetryAttempts += 1;
+      backendRetryTimer = setTimeout(async function () {
+        backendRetryTimer = null;
+        try {
+          await initSharedBackend({ isRetry: true });
+        } catch (_) { }
+      }, delay);
+    }
+
+    async function fetchSiteStateViaRpc() {
+      if (!supabaseClient || siteStateRpcSupported === false) return null;
+      const { data, error } = await supabaseClient.rpc('get_site_state_snapshot');
+      if (error) {
+        const message = getSupabaseErrorMessage(error).toLowerCase();
+        if (message.indexOf('function') !== -1 && message.indexOf('get_site_state_snapshot') !== -1) {
+          siteStateRpcSupported = false;
+          return null;
+        }
+        throw error;
+      }
+      siteStateRpcSupported = true;
+      return data || [];
+    }
+
+    async function upsertSiteStateViaRpc(key, value) {
+      if (!supabaseClient || siteStateRpcSupported === false) return null;
+      const { error } = await supabaseClient.rpc('upsert_site_state', { p_key: key, p_value: value });
+      if (error) {
+        const message = getSupabaseErrorMessage(error).toLowerCase();
+        if (message.indexOf('function') !== -1 && message.indexOf('upsert_site_state') !== -1) {
+          siteStateRpcSupported = false;
+          return null;
+        }
+        throw error;
+      }
+      siteStateRpcSupported = true;
+      return true;
+    }
+
     async function persistSharedStateKey(key, value, options) {
       const opts = options || {};
       sharedState[key] = deepClone(value);
@@ -5225,6 +5295,19 @@ function getSharedStateValue(key, fallback) {
       }
 
       const payload = [{ state_key: key, state_value: sharedState[key] }];
+
+      try {
+        const rpcSaved = await upsertSiteStateViaRpc(key, sharedState[key]);
+        if (rpcSaved) {
+          updateBackendStatus('Connected to shared database');
+          backendRetryAttempts = 0;
+          clearBackendReconnectTimer();
+          if (!opts.silent) renderAll();
+          return true;
+        }
+      } catch (rpcErr) {
+        console.error('site_state rpc write failed:', rpcErr);
+      }
 
       let result = await supabaseClient
         .from('site_state')
@@ -5264,11 +5347,15 @@ function getSharedStateValue(key, fallback) {
         }
 
         updateBackendStatus('Backend write error: ' + msg);
+        backendReady = false;
+        scheduleBackendReconnect();
         if (!opts.silent) renderAll();
         return false;
       }
 
       updateBackendStatus('Connected to shared database');
+      backendRetryAttempts = 0;
+      clearBackendReconnectTimer();
       if (!opts.silent) renderAll();
       return true;
     }
@@ -5295,13 +5382,23 @@ function getSharedStateValue(key, fallback) {
 
     async function fetchRemoteStateSnapshot() {
       if (!supabaseClient) return mergeDefaultState({});
-      const { data, error } = await supabaseClient.from('site_state').select('state_key,state_value');
-      if (error) {
-        console.error(error);
-        throw error;
+      let rows = await fetchSiteStateViaRpc();
+      if (!rows) {
+        const response = await withTimeout(
+          supabaseClient.from('site_state').select('state_key,state_value'),
+          BACKEND_INIT_TIMEOUT_MS,
+          'Shared state fetch'
+        );
+        const data = response.data;
+        const error = response.error;
+        if (error) {
+          console.error(error);
+          throw error;
+        }
+        rows = data || [];
       }
       const remote = {};
-      (data || []).forEach(function (row) { remote[row.state_key] = row.state_value; });
+      (rows || []).forEach(function (row) { remote[row.state_key] = row.state_value; });
       return mergeDefaultState(remote);
     }
 
@@ -5333,7 +5430,10 @@ function getSharedStateValue(key, fallback) {
       }
     }
 
-    async function initSharedBackend() {
+    async function initSharedBackend(options) {
+      const opts = options || {};
+      if (backendInitInFlight) return backendReady;
+      backendInitInFlight = true;
       const hasConfig = VMY_BACKEND_CONFIG.supabaseUrl && VMY_BACKEND_CONFIG.supabaseAnonKey && window.supabase && window.supabase.createClient;
       if (!hasConfig) {
         backendReady = false;
@@ -5344,15 +5444,18 @@ function getSharedStateValue(key, fallback) {
         cacheWebsitePicDefaults();
         applyWebsitePics({ smooth: true });
         applyBoardPhotos({ smooth: true });
+        backendInitInFlight = false;
         return false;
       }
       sharedState = getCachedFallbackState();
       syncLegacyVariablesFromSharedState();
       try {
-        supabaseClient = window.supabase.createClient(VMY_BACKEND_CONFIG.supabaseUrl, VMY_BACKEND_CONFIG.supabaseAnonKey);
+        if (!supabaseClient) {
+          supabaseClient = window.supabase.createClient(VMY_BACKEND_CONFIG.supabaseUrl, VMY_BACKEND_CONFIG.supabaseAnonKey);
+        }
         subscribeToSharedState();
 
-        const remoteState = await fetchRemoteStateSnapshot();
+        const remoteState = await withTimeout(fetchRemoteStateSnapshot(), BACKEND_INIT_TIMEOUT_MS, 'Shared backend init');
         if (remoteState) {
           sharedState = remoteState;
           syncLegacyVariablesFromSharedState();
@@ -5362,6 +5465,8 @@ function getSharedStateValue(key, fallback) {
         }
 
         backendReady = true;
+        backendRetryAttempts = 0;
+        clearBackendReconnectTimer();
         if (!localWebsitePicsCache) localWebsitePicsCache = await websitePicsDbGetAll() || {};
         await flushPendingWebsitePics();
         updateBackendStatus('Connected to shared database');
@@ -5373,7 +5478,7 @@ function getSharedStateValue(key, fallback) {
         loadCMSContent();
         finalizeImageHydration();
         renderAll();
-
+        backendInitInFlight = false;
         return true;
       } catch (err) {
         console.error(err);
@@ -5387,6 +5492,8 @@ function getSharedStateValue(key, fallback) {
         applyBoardPhotos({ smooth: true });
         finalizeImageHydration();
         renderAll();
+        backendInitInFlight = false;
+        scheduleBackendReconnect();
         return false;
       }
     }
@@ -5411,7 +5518,16 @@ function getSharedStateValue(key, fallback) {
           finalizeImageHydration();
           renderAll();
         })
-        .subscribe();
+        .subscribe(function (status) {
+          if (status === 'SUBSCRIBED') {
+            backendReady = true;
+            backendRetryAttempts = 0;
+            clearBackendReconnectTimer();
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            backendReady = false;
+            scheduleBackendReconnect();
+          }
+        });
     }
 
     let eventsData = getSharedStateValue('events', defaultEvents);
@@ -7196,6 +7312,7 @@ function getSharedStateValue(key, fallback) {
           return 'published';
         }
       }
+      scheduleBackendReconnect();
       return 'queued';
     }
 
@@ -7223,6 +7340,7 @@ function getSharedStateValue(key, fallback) {
           return 'published';
         }
       }
+      scheduleBackendReconnect();
       return 'queued';
     }
 
