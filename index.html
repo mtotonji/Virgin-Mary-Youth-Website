@@ -1622,6 +1622,36 @@
       margin-top: .25rem;
     }
 
+    .modal-event-summary {
+      margin-top: .9rem;
+      padding: .9rem 1rem;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, .1);
+      border: 1px solid rgba(255, 255, 255, .14);
+      color: rgba(255, 255, 255, .86);
+      max-width: 100%;
+    }
+
+    .modal-event-summary .modal-event-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .35rem .8rem;
+      margin-bottom: .55rem;
+      color: rgba(255, 255, 255, .72);
+      font-size: .8rem;
+      font-family: 'DM Sans', sans-serif;
+      font-weight: 600;
+    }
+
+    .modal-event-summary .modal-event-desc {
+      color: rgba(255, 255, 255, .9);
+      font-size: .9rem;
+      line-height: 1.55;
+      font-family: 'DM Sans', sans-serif;
+      margin: 0;
+      white-space: pre-wrap;
+    }
+
     .modal-close {
       background: rgba(255, 255, 255, .12);
       border: none;
@@ -5054,6 +5084,10 @@
         <div>
           <h2>Register for Event</h2>
           <p id="regEventTitle">Event Name</p>
+          <div class="modal-event-summary" id="regEventSummary" style="display:none">
+            <div class="modal-event-meta" id="regEventMeta"></div>
+            <p class="modal-event-desc" id="regEventDesc"></p>
+          </div>
         </div>
         <button class="modal-close" onclick="closeRegModal()">✕</button>
       </div>
@@ -6367,6 +6401,19 @@ function getSharedStateValue(key, fallback) {
       const ev = eventsData.find(e => e.id == eventId); if (!ev) return;
       document.getElementById('regEventTitle').textContent = ev.title;
       document.getElementById('regEventId').value = eventId;
+
+      const summary = document.getElementById('regEventSummary');
+      const meta = document.getElementById('regEventMeta');
+      const desc = document.getElementById('regEventDesc');
+      if (summary && meta && desc) {
+        const pieces = [];
+        if (ev.time || ev.date) pieces.push([formatTime(ev.time), formatDate(ev.date)].filter(Boolean).join(' · '));
+        if (ev.location) pieces.push(ev.location);
+        meta.textContent = pieces.join('  •  ');
+        desc.textContent = ev.desc || 'No event description has been added yet.';
+        summary.style.display = 'block';
+      }
+
       ['regFirst', 'regLast', 'regEmail', 'regPhone', 'regNotes'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
       document.getElementById('regAge').value = '';
       document.getElementById('regModal').classList.add('open');
