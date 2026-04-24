@@ -4889,15 +4889,23 @@
             <div class="form-group"><label>Type / Tag</label><input id="ae-type"
                 placeholder="e.g. Retreat, Meeting, Service" /></div>
           </div>
+          <input type="hidden" id="ae-edit-id" value="" />
           <div class="form-row">
             <div class="form-group"><label>Date</label><input type="date" id="ae-date" /></div>
             <div class="form-group"><label>Time</label><input type="time" id="ae-time" /></div>
+            <div class="form-group"><label>Event Status</label><select id="ae-status">
+                <option value="upcoming">Upcoming Event</option>
+                <option value="past">Past Event</option>
+              </select></div>
           </div>
           <div class="form-group"><label>Location</label><input id="ae-location" placeholder="e.g. St. Mary's Hall" />
           </div>
           <div class="form-group"><label>Description</label><textarea id="ae-desc"
               placeholder="Describe the event..."></textarea></div>
-          <button class="btn btn-primary" onclick="addEvent()">Add Event</button>
+          <div style="display:flex;gap:.75rem;flex-wrap:wrap">
+            <button class="btn btn-primary" id="ae-submit-btn" onclick="addEvent()">Add Event</button>
+            <button class="btn btn-gold" id="ae-cancel-btn" onclick="cancelEditEvent()" style="display:none">Cancel Edit</button>
+          </div>
         </div>
         <div class="admin-card">
           <h3>📋 Existing Events</h3>
@@ -5146,11 +5154,12 @@
       { id: 4, title: 'Summer Kickoff BBQ', type: 'Social', date: '2025-06-07', time: '14:00', location: 'Church Outdoor Garden', desc: "Celebrate summer with us! Burgers, games, music, and great company. Bring your friends - all are welcome to this free event.", past: false }
     ];
     const defaultPastEvents = [
-      { id: 'p1', title: 'Christmas Talent Show', date: '2024-12-21', location: "St. Mary's Hall", desc: 'An evening of performances, music, and holiday cheer.' },
-      { id: 'p2', title: 'Fall Retreat', date: '2024-10-05', location: 'Mountain Camp', desc: 'A weekend retreat focused on gratitude and community.' },
-      { id: 'p3', title: 'Back-to-School Social', date: '2024-09-07', location: 'Church Garden', desc: 'Welcome back gathering to kick off the new school year.' },
-      { id: 'p4', title: 'Easter Vigil Prep', date: '2024-03-30', location: "St. Mary's Church", desc: 'Helping prepare and participate in the Easter Vigil celebration.' }
+      { id: 9001, title: 'Christmas Talent Show', type: 'Past Event', date: '2024-12-21', time: '', location: "St. Mary's Hall", desc: 'An evening of performances, music, and holiday cheer.', past: true },
+      { id: 9002, title: 'Fall Retreat', type: 'Past Event', date: '2024-10-05', time: '', location: 'Mountain Camp', desc: 'A weekend retreat focused on gratitude and community.', past: true },
+      { id: 9003, title: 'Back-to-School Social', type: 'Past Event', date: '2024-09-07', time: '', location: 'Church Garden', desc: 'Welcome back gathering to kick off the new school year.', past: true },
+      { id: 9004, title: 'Easter Vigil Prep', type: 'Past Event', date: '2024-03-30', time: '', location: "St. Mary's Church", desc: 'Helping prepare and participate in the Easter Vigil celebration.', past: true }
     ];
+    const defaultAllEvents = defaultEvents.concat(defaultPastEvents);
     const defaultUpdates = [
       { id: 1, title: 'Spring Retreat Registration is Now Open!', tag: 'announcement', body: "We're so excited to announce that registration for our Spring Retreat 2025 is officially open! This year's theme is \"Renewed & Rooted\" - a day of reflection, prayer, and community. Spots are limited, so register early!", date: 'March 10, 2025' },
       { id: 2, title: 'Reminder: Monthly Meeting This Sunday', tag: 'reminder', body: "Friendly reminder that our monthly youth meeting takes place this Sunday right after the 10:30 AM Liturgy. We'll have an exciting guest speaker and light refreshments. See you there!", date: 'March 6, 2025' },
@@ -5172,7 +5181,7 @@
     };
 
     const SHARED_STATE_DEFAULTS = {
-      events: defaultEvents,
+      events: defaultAllEvents,
       updates: defaultUpdates,
       merch: defaultMerch,
       regs: [],
@@ -5262,7 +5271,7 @@
     }
 
     function syncLegacyVariablesFromSharedState() {
-      eventsData = deepClone(sharedState.events || defaultEvents);
+      eventsData = deepClone(sharedState.events || defaultAllEvents);
       updatesData = deepClone(sharedState.updates || defaultUpdates);
       merchData = deepClone(sharedState.merch || defaultMerch);
       registrations = deepClone(sharedState.regs || []);
@@ -5729,7 +5738,7 @@ function getSharedStateValue(key, fallback) {
         });
     }
 
-    let eventsData = getSharedStateValue('events', defaultEvents);
+    let eventsData = getSharedStateValue('events', defaultAllEvents);
     let updatesData = getSharedStateValue('updates', defaultUpdates);
     let merchData = getSharedStateValue('merch', defaultMerch);
     let registrations = getSharedStateValue('regs', []);
@@ -6281,12 +6290,14 @@ function getSharedStateValue(key, fallback) {
     function renderEventsPage() {
       const g = document.getElementById('eventsFullGrid');
       const pg = document.getElementById('pastEventsGrid');
-      if (g) g.innerHTML = eventsData.filter(e => !e.past).map(eventCardHTML).join('') || '<p style="color:var(--text-lt)">No upcoming events.</p>';
-      if (pg) pg.innerHTML = defaultPastEvents.map(p => `
+      const upcomingEvents = eventsData.filter(e => !e.past).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+      const pastEvents = eventsData.filter(e => e.past).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+      if (g) g.innerHTML = upcomingEvents.map(eventCardHTML).join('') || '<p style="color:var(--text-lt)">No upcoming events.</p>';
+      if (pg) pg.innerHTML = pastEvents.length ? pastEvents.map(p => `
     <div class="past-event-card">
       <div class="past-badge"><span class="month">${formatMonth(p.date)}</span><span class="day">${formatDay(p.date)}</span></div>
       <div class="past-event-info"><h4>${p.title}</h4><p>${p.location} · ${p.desc}</p></div>
-    </div>`).join('');
+    </div>`).join('') : '<div class="admin-empty" style="background:#fff">No past events yet. Add one from the admin Events tab and set the status to Past Event.</div>';
     }
 
     /* ── UPDATES PAGE ── */
@@ -6655,21 +6666,90 @@ function getSharedStateValue(key, fallback) {
       if (name === 'registrations') renderRegistrationsTable();
     }
 
-    /* ── Admin: Add Event ── */
+    /* ── Admin: Add / Edit Event ── */
+    function clearEventForm() {
+      ['ae-title', 'ae-type', 'ae-date', 'ae-time', 'ae-location', 'ae-desc'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+      const status = document.getElementById('ae-status');
+      if (status) status.value = 'upcoming';
+      const editId = document.getElementById('ae-edit-id');
+      if (editId) editId.value = '';
+      const submitBtn = document.getElementById('ae-submit-btn');
+      if (submitBtn) submitBtn.textContent = 'Add Event';
+      const cancelBtn = document.getElementById('ae-cancel-btn');
+      if (cancelBtn) cancelBtn.style.display = 'none';
+    }
+
     async function addEvent() {
       const title = document.getElementById('ae-title').value.trim();
       const date = document.getElementById('ae-date').value;
       const location = document.getElementById('ae-location').value.trim();
       if (!title || !date || !location) { showToast('Title, date, and location required.', 'error'); return; }
-      eventsData.push({
-        id: Date.now(), title, type: document.getElementById('ae-type').value.trim() || 'Event',
-        date, time: document.getElementById('ae-time').value, location,
-        desc: document.getElementById('ae-desc').value.trim(), past: false
-      });
+
+      const editId = (document.getElementById('ae-edit-id') && document.getElementById('ae-edit-id').value) || '';
+      const eventStatus = (document.getElementById('ae-status') && document.getElementById('ae-status').value) || 'upcoming';
+      const eventPayload = {
+        title,
+        type: document.getElementById('ae-type').value.trim() || (eventStatus === 'past' ? 'Past Event' : 'Event'),
+        date,
+        time: document.getElementById('ae-time').value,
+        location,
+        desc: document.getElementById('ae-desc').value.trim(),
+        past: eventStatus === 'past'
+      };
+
+      if (editId) {
+        eventsData = eventsData.map(e => String(e.id) === String(editId) ? Object.assign({}, e, eventPayload) : e);
+        await persistSharedStateKey('events', eventsData);
+        clearEventForm();
+        renderAdminLists(); renderEventsPage(); renderHomeEvents();
+        showToast('✓ Event updated!');
+        return;
+      }
+
+      eventsData.push(Object.assign({ id: Date.now() }, eventPayload));
       await persistSharedStateKey('events', eventsData);
-      ['ae-title', 'ae-type', 'ae-date', 'ae-time', 'ae-location', 'ae-desc'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+      clearEventForm();
       renderAdminLists(); renderEventsPage(); renderHomeEvents();
-      showToast('✓ Event added!');
+      showToast(eventPayload.past ? '✓ Past event added!' : '✓ Event added!');
+    }
+
+    function editEvent(id) {
+      const e = eventsData.find(item => String(item.id) === String(id));
+      if (!e) { showToast('Could not find that event.', 'error'); return; }
+      const setVal = (fieldId, value) => {
+        const el = document.getElementById(fieldId);
+        if (el) el.value = value || '';
+      };
+      setVal('ae-edit-id', e.id);
+      setVal('ae-title', e.title);
+      setVal('ae-type', e.type || '');
+      setVal('ae-date', e.date);
+      setVal('ae-time', e.time || '');
+      setVal('ae-location', e.location);
+      setVal('ae-desc', e.desc);
+      setVal('ae-status', e.past ? 'past' : 'upcoming');
+      const submitBtn = document.getElementById('ae-submit-btn');
+      if (submitBtn) submitBtn.textContent = 'Save Event';
+      const cancelBtn = document.getElementById('ae-cancel-btn');
+      if (cancelBtn) cancelBtn.style.display = 'inline-flex';
+      const formTop = document.getElementById('ae-title');
+      if (formTop) formTop.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function cancelEditEvent() {
+      clearEventForm();
+      showToast('Event edit canceled.');
+    }
+
+    async function toggleEventPast(id) {
+      eventsData = eventsData.map(e => String(e.id) === String(id) ? Object.assign({}, e, { past: !e.past }) : e);
+      await persistSharedStateKey('events', eventsData);
+      renderAdminLists(); renderEventsPage(); renderHomeEvents();
+      const item = eventsData.find(e => String(e.id) === String(id));
+      showToast(item && item.past ? 'Event moved to Past Events.' : 'Event moved to Upcoming Events.');
     }
 
     /* ── Admin: Add Update ── */
@@ -6765,7 +6845,11 @@ function getSharedStateValue(key, fallback) {
 
     function renderAdminLists() {
       const el = document.getElementById('adminEventsList');
-      if (el) el.innerHTML = eventsData.map(e => `<div class="admin-list-row"><div><strong>${e.title}</strong><span class="admin-list-meta">${e.date} · ${e.type}</span></div><button class="admin-del-btn" onclick="deleteEvent(${e.id})">Delete</button></div>`).join('') || '<div class="admin-empty">No events yet.</div>';
+      if (el) el.innerHTML = eventsData.map(e => {
+        const label = e.past ? 'Past Event' : 'Upcoming Event';
+        const toggleLabel = e.past ? 'Move to Upcoming' : 'Move to Past';
+        return `<div class="admin-list-row"><div><strong>${e.title}</strong><span class="admin-list-meta">${e.date} · ${e.type || 'Event'} · ${label}</span></div><div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap"><button class="admin-del-btn" style="border:1px solid var(--cream-dk);padding:.35rem .75rem;border-radius:999px;background:#fff;color:var(--navy)" onclick="editEvent(${e.id})">Edit</button><button class="admin-del-btn" style="border:1px solid var(--cream-dk);padding:.35rem .75rem;border-radius:999px;background:#fff;color:var(--navy)" onclick="toggleEventPast(${e.id})">${toggleLabel}</button><button class="admin-del-btn" onclick="deleteEvent(${e.id})">Delete</button></div></div>`;
+      }).join('') || '<div class="admin-empty">No events yet.</div>';
       const ul = document.getElementById('adminUpdatesList');
       if (ul) ul.innerHTML = updatesData.map(u => `<div class="admin-list-row"><div><strong>${u.title}</strong><span class="admin-list-meta">${u.date}</span></div><button class="admin-del-btn" onclick="deleteUpdate(${u.id})">Delete</button></div>`).join('') || '<div class="admin-empty">No updates yet.</div>';
       const ml = document.getElementById('adminMerchList');
@@ -6957,7 +7041,7 @@ function getSharedStateValue(key, fallback) {
       showToast(item && item.soldOut ? 'Merch item marked sold out.' : 'Merch item marked in stock.');
     }
 
-    async function deleteEvent(id) { eventsData = eventsData.filter(e => e.id !== id); await persistSharedStateKey('events', eventsData); renderAdminLists(); renderEventsPage(); renderHomeEvents(); showToast('Event removed.'); }
+    async function deleteEvent(id) { eventsData = eventsData.filter(e => String(e.id) !== String(id)); await persistSharedStateKey('events', eventsData); renderAdminLists(); renderEventsPage(); renderHomeEvents(); showToast('Event removed.'); }
     async function deleteUpdate(id) { updatesData = updatesData.filter(u => u.id !== id); await persistSharedStateKey('updates', updatesData); renderAdminLists(); renderUpdatesPage(); renderHomeUpdates(); showToast('Update removed.'); }
     async function deleteMerch(id) { merchData = merchData.filter(m => m.id !== id); await persistSharedStateKey('merch', merchData); renderAdminLists(); renderMerchPage(); renderHomeMerch(); renderMerchImageAdmin(); showToast('Item removed.'); }
 
